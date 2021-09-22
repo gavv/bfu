@@ -1,0 +1,929 @@
+#! /usr/bin/env perl
+
+use Getopt::Std;
+use Pod::Usage;
+use Time::HiRes 'sleep';
+
+use re 'eval';
+
+
+=for man
+
+=head1 NAME
+
+bfu - brainfuck command line debugger
+
+=head1 SYNOPSIS
+
+bfu [OPTIONS] [FILES] ...
+
+Options:
+
+  -n          use numbers in i/o
+  -i          be interpreter
+  -s FLOAT    show a slide show
+
+  -p          preprocess like awib bfpp
+  -d          preprocess program and data for dbfi
+
+  -P          preprocess only, don't run
+  -F          print formatted program
+
+  -h          show help
+  -v          show version
+  -m          show man page
+
+With no FILES, reads program from STDIN.
+Input is reading after '!' character in program, and then from STDIN.
+
+=cut
+
+sub HELP_MESSAGE {
+	pod2usage (	-output  => shift,
+				-verbose => 0 + $opt_m * 2,
+				-message => "bfu, brainfuck command line debugger" );
+}
+
+sub VERSION_MESSAGE {
+	return if $ARGV[0] eq '--help'; # i hope it wasn't a bug.
+	print <<VERSION;
+bfu 0.2, brainfuck debugger
+This program comes with ABSOLUTELY NO WARRANTY.
+This is free software, and you are welcome to redistribute it
+under certain conditions.
+VERSION
+}
+
+	@ARGV = map { /^\-/ ? split /\s+/, $_ : $_ } @ARGV;
+	$Getopt::Std::STANDARD_HELP_VERSION = 'true';
+
+	# so you can start your bf programs with `/usr/bin/bfu -p -i`
+	#
+
+
+getopts 'ipPFnds:hvm'
+	or die "Try `bfu -h`. Stopped";
+
+
+Getopt::Std::help_mess '--help', '' and exit if $opt_h or $opt_m;
+Getopt::Std::version_mess '--version', '' and exit if $opt_v;
+
+
+
+our ($run, $pre, $int, $slp, $dbfi, $enum) = ($opt_i, $opt_p, $opt_n, $opt_s, $opt_d, $opt_F);
+$pre = 'true' if $opt_P || $opt_F;
+
+
+
+=begin comment
+
+ - $run indicates if we are going to debug, or only to run program.
+
+ - $int indicates i/o mode. if $int is true, bfu reads and writes
+ 	characters as text with decimal integers.
+
+ - $pre indicates if we need to do any preprocess work. its important
+	not only for #includes, but also for line numbering and other debugging stuff.
+
+
+ * ! ($run || $opt_P || $opt_F) means interactive mode.
+
+=end comment
+
+=cut
+
+
+unless ($run || $opt_P || $opt_F) {
+	print <<INTRO;
++ bfu 0.2
++ brainfuck debugger
+INTRO
+}
+
+
+=for man
+
+=head1 COMMANDS
+
+=head2 Syntax
+
+=head3 EXPR
+
+EXPR is simple c-style expression with numbers and symbols.
+
+`@' and `#' characters have special meanings: `@EXPR' expands to value of cell number EXPR (or current cell, if EXPR is omitted), `#' expands to number of current cell. 
+
+If there is `$' before `@' or `#' characters, then its value will not be expanded immediately, but every time when bfu will need its value (for example, after every command in breakpoint condition).
+
+=head3 COND
+
+COND is condition to check in breakpoints. It can be used for checking command or memory pointer. Possible forms are:
+
+>EXPR, <EXPR, =EXPR, etc -- means that value we are checking should be greater, lesser, etc then EXPR. =EXPR is equal to EXPR;
+
+?[EXPR] -- if EXPR isn't omitted, true if EXPR is true, with no EXPR true if cell with number of checking value is non-zero;
+
+[EXPR1 ; EXPR2] -- means value should be between EXPR1 and EXPR2.
+
+=head3 CMND
+
+CMND is one of eight brainfuck commands or `*' which means any command that modifies memory.
+
+=cut
+
+
+# expression syntax and evaluation (don't trust vim-syntax !)
+#
+unless ($run) {
+
+	our $cmnd = qr{
+		(?: [\+\-\<\>\[\]\,\.] )
+	}x;
+
+	our $oper = qr{
+		(?: \*\* | \<\= | \>\= | \=\= | [\+\-\*\/\<\>] )
+	}x;
+
+	our $expr = qr{
+		(?:
+			\( \s* (??{$expr}) \s* \)
+			|
+			[\-\+]?\d+
+			|
+			\$?\# (?{push @C, pos})
+			|
+			\$?\@
+			(?{push @Z, pos})
+				(?:
+					(??{$expr}) | \d* (?! \( )
+				)
+			(?{push @L, pop @Z ; push @R, pos})
+		)
+		(?: \s* $oper \s* (??{$expr}) \s* )*
+		(?! \s* $oper)
+	}x;
+
+		
+		sub correct {
+			my ($B, $D, $A, $O) = @_;
+			foreach (@$A) {
+				$_ -= $D if $_ - $O >= $B;
+			}
+		}
+
+	sub expr($$) {
+
+		my (@LL, @RR, @CC);
+		my ($ee, $ld, $n, $push);
+
+		my $S = shift;
+		my $O = (shift) - length $S;
+
+		foreach (@C) {
+			$_ -= $O;
+			$n ++;
+
+			if ($_ > 1 and substr ($S, $_ - 2, 1) eq '$') {
+				substr ($S, $_ - 2, 1) = "";
+				push @CC, $_ - 1;
+				$ld = 1;
+			} else {
+				if (length ($S) > 0 or substr ($S, $_, 1) !~ /[\[\]]/) {
+					substr $S, $_ - 1, 1, "$pos";
+					$ld = 1 - length "$pos";
+				}
+			}
+
+			correct ($_, $ld, \@L, $O) if @L;
+			correct ($_, $ld, \@R, $O) if @R;
+			correct ($_, $ld, \@CC) if @CC;
+
+			for my $i ($n .. $#C) {
+				$C[$i] -= $ld if $C[$i] - $O >= $_;
+			}
+		}
+
+		for (0 .. $#L) {
+			$L[$_] -= $O;
+			$R[$_] -= $O;
+
+			if ($L[$_] > 1 and substr ($S, $L[$_] - 2, 1) eq '$') {
+				substr ($S, $L[$_] - 2, 1) = "";
+				$push = $ld = 1;
+			} else {
+				if ($R[$_] > $L[$_]) {
+					$ee = $mem[(eval substr $S, $L[$_], $R[$_] - $L[$_])];
+				} else {
+					$ee = $mem[$pos];
+				}
+				$ld = 1 + $R[$_] - $L[$_] - length $ee;
+				substr ($S, $L[$_] - 1, $R[$_] - $L[$_] + 1) = "$ee";
+			}
+
+			correct ($L[$_], $ld, \@CC) if @CC;
+			correct ($L[$_], $ld, \@LL) if @LL;
+			correct ($L[$_], $ld, \@RR) if @RR;
+
+			if ($push) {
+				push @LL, $L[$_] - 1;
+				push @RR, $R[$_] - 1;
+			}
+
+			for my $i ($_ + 1 .. $#L) {
+				$L[$i] -= $ld if $L[$i] - $O >= $L[$_];
+				$R[$i] -= $ld if $R[$i] - $O >= $R[$_];
+			}
+		}
+
+		return 0 + eval $S unless @LL or @CC;
+		return [ $S, \@LL, \@RR, \@CC ];
+
+	}
+
+	sub val($) {
+
+		my $ref = shift;
+		return $ref unless ref $ref;
+
+		local @L = @{$ref->[1]};
+		local @R = @{$ref->[2]};
+		local @C = @{$ref->[3]};
+
+		return expr $ref->[0], length $ref->[0];
+	}
+}
+
+
+
+@idx = (undef);
+
+
+# read program and maybe preprocess
+#
+LINE: while (<>) {
+
+	$_ = shift @pre if @pre;
+	push @idx, $aa unless $run;
+	chomp;
+
+	# be bfpp
+	#
+	if ($pre) {
+		if (/^\s*\#\s*include\s*\(\s*(.*?)\s*\)/) {
+			push @pre, split /\n/, `cat $1`;
+			redo LINE;
+		}
+		next LINE if /^\s*$/;
+		next LINE if /^\s*[\#\%]/;
+	}
+
+	# if program contains '!', read data after it as program input beginning
+	# program should end with EOF or '!'
+	#
+	if (/^(.*?)\!(.*)$/) {
+		push @info, $1 unless $run;		# remember lines for debugging
+		$xdi[$#info] = $#idx unless $run;
+		$aa ++;
+
+		$text .= $1;
+		$data .= $2;
+		last LINE;
+	} else {
+		push @info, $_ unless $run;
+		$xdi[$#info] = $#idx unless $run;
+		$aa ++;
+
+		$text .= $_;
+	}
+
+} continue {
+
+	redo LINE if @pre
+}
+
+
+# -F: print preprocessed program with line numbers
+#
+if ($enum) {
+	my $i =0;
+	print $i , "\t" , $xdi[$i] , "\t" , $_ , "\n" and $i++ for @info;
+	exit
+}
+
+
+# -d and -P: prepare and print text, then exit
+#
+if ($dbfi || $opt_P) {
+	$text  =~ s/(?:$cmnd)+//g;
+	if (! $int) {
+		print $text;
+		if ($dbfi) {
+			print '!' , $data;
+			print while <>;
+		} else {
+			print '!' . $data if $data;
+		}
+	} else {
+		print $text;
+		if ($dbfi) {
+			print '!';
+		} else {
+			print '!' if $data;
+		}
+		for (split /\s+/, $data) {
+			syswrite STDOUT, pack "c", 0 + $_
+		}
+		if ($dbfi) {
+			while (<>) {
+				for (split /\s+/, $_) {
+					syswrite STDOUT, pack "c", 0 + $_
+				}
+			}
+		}
+	}
+	exit
+}
+
+
+=begin comment
+
+ - @mem is memory array
+ - $pos is data pointer and $dir is direction of its moving
+
+ - @dat is list of input symbols (it is filling from STDIN if necessary)
+
+ - @stk is stack of embedded cycles
+ - @brk is stack of hooks (or breakpoints)
+
+ - $offset is offest in current line which number is $number
+ - @info, @idx and @xdi are used for source code information
+
+=end comment
+
+=cut
+
+
+@dat = map { $int ? 0 + $_ : ord } split //, $data;
+($lview, $rview) = (0, 20);
+
+$mem[$_] = 0 for ($lview .. $rview);
+$pos = 0; $dir = 1;
+
+	undef $data;
+
+
+our $n = -1;
+our (@stk, @brk);
+
+my ($deep, $offset, $number);
+
+our $WIDTH = 40;
+our ($LBC, $RBC) = ('{', '}');  # for '{' inside (?{})
+
+$| = 1;
+
+
+print "\n\n\n\n[3A" unless $run;
+$text .= '!';
+
+
+# run program
+#
+SYMBOL: while ('we trust in the strength of the shield') {
+
+	if (($n += $dir) >= 0) {
+		$_ = substr ($text, $n, 1) || '!'
+	} elsif ($dir == -1 and $n < 0) {
+		$dir = 1;
+		redo SYMBOL
+	}
+	
+	do {
+		if ($dir == 1 and $offset == length $info[$number]) {
+			$number ++;
+			$offset = $noff = 0;
+		} elsif ($dir == -1 and $offset < 0) {
+			$number --;
+			$offset = $noff = length $info[$number];
+		}
+
+		$oldoffset = $offset;
+		$olddir = $dir;
+		$offset += $dir;
+		$noff += $dir;
+
+	} unless ($run);
+
+	next unless /\!|$cmnd/;
+
+	# loops
+	#
+	if ($deep and $_ ne '!') {
+		if ($dir == 1) {
+			if ($_ eq ']') {
+				if (-- $deep and ! exists $rcache{$target[-1]}) {
+					$rcache{$target[-1]} = [ $n, $number, $offset, $noff ] if $n - $target[-1] > 13;
+					pop @target;
+				}
+			} elsif ($_ eq '[') {
+				$lcache{$n} = $stk[$#stk] unless $run or exists $lcache{$n};
+				$deep ++;
+				push @target, $n;
+			}
+		}
+
+		redo SYMBOL
+	}
+
+	# hooks
+	#
+	if (@brk) {
+
+		if ($brk[0]->[0] eq 'for') {
+			shift @brk if /\]/ and !$mem[$pos] and $#stk == $brk[0]->[1] - val $brk[0]->[2]
+
+		} elsif ($brk[0]->[0] eq 'line') {
+			shift @brk if $number == $brk[0]->[1]
+
+		} elsif ($brk[0]->[0] eq 'cell') {
+			shift @brk if $_ =~ $brk[0]->[1] and $brk[0]->[2]->($pos)
+
+		} elsif ($brk[0]->[0] eq 'cmnd') {
+			if ($_ =~ $brk[0]->[1] and $brk[0]->[2]->($dir == 1 ? $noff - 1 : $noff)) {
+				$dir = +1;
+				shift @brk;
+				redo SYMBOL if $olddir == -1;
+			}
+		}
+	}
+
+	DEBUG:
+	{
+
+	# debugger output
+	#
+	unless ($run || @brk) {
+
+		my $offset = $oldoffset;
+		my ($left, $right, $i, $c) = $WIDTH;
+
+		$left = $offset if $offset - $left < 0;
+		$right = 2 * $WIDTH - $offset;
+
+		$c = "[0;33m{[00m" . $xdi[$number] . ":" . ($noff - 1) . "[0;33m}[00m ";
+		$c .= substr $info[$number], $offset - $left, $left;
+		$c .= "[1;32m" . $_ . "[00m";
+		$c .= substr $info[$number], $offset + 1, $right;
+
+		print "\r[K" . $c; 
+		print "\r[1A[K[1;30m$lview >[00m " . join " ", map {
+			$_ += 0;
+			if ($i++ + $lview == $pos) {
+				"[0;32m[[00m" . "$_" . "[0;32m][00m"
+			} else {
+				"$_"
+			}
+		} @mem[$lview .. $rview];
+		print " [1;30m< $rview[00m";
+
+	}
+
+=for man
+
+=head2 Commands
+
+=head3 , [EXPR1] EXPR2
+
+Assign value of EXPR2 to cell number EXPR1 or current cell if it is omitted.
+
+=head3 . EXPR
+
+Print value of EXPR.
+
+=head3 ^ [EXPR]
+
+Jump to line number EXPR (i.e. continue execution until line number will be equal to EXPR). Jump to the next line if EXPR is omitted.
+
+=head3 @[!][CMND] [COND]
+
+Continue until cell number will satisfy COND. If CMND isn't omitted, command also should satisfy CMND (or should _not_ satisfy if `!' is not omitted). If CMND is not omitted, COND can be omitted to jump to any cell when command will satisfy CMND.
+
+=head3 } and {
+
+Are the same as `@' command, but conformably to instruction pointer instead of data pointer. `}' jumps forward and `{' jumps backwards, so you can easily undo and redo any commands. If all operands are omitted, run only one command.
+
+=head3 }} and {{
+
+Change direction to forward or backward. It affects on action of B<empty command>.
+
+=head3 ] [EXPR]
+
+Continue until exit from current cycle if EXPR is omitted or nearest parent cycle from which current is of depth EXPR if not.
+
+=head3 > [EXPR] and < [EXPR]
+
+Shift visible frame of memory array right or left to EXPR positions (or a few positions if EXPR is omitted). Use `<<' to return to the begining.
+
+=head3 !
+
+Quit debugger.
+
+=head3 empty command
+
+Just press enter to run next command (or previous if `{{' was called).
+
+=cut
+
+	# read debugger command
+	
+	unless ($slp || $run || @brk) {
+
+		print "[3B\r" . (' ' x 50) . "\r";
+		unless ($WARN) {
+			print "\$ "
+		} else {
+			print "[1;31m\$[00m ";
+			undef $WARN
+		}
+
+		local $_ = <STDIN>; print "[3A";
+
+		chomp;
+		s/^\s*(.*?)\s*$/\1/;
+
+		last SYMBOL if /^\!$/;
+
+
+		redo DEBUG
+		if m{
+			^ \, \s* (?{local ($p, $s)})
+				(?: (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $p = expr $1, pos}) )?
+				\s* (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $s = expr $2, pos})
+			$
+
+			(?{ $mem [$1 ? val $p : $pos] = val $s })
+
+		}x or m{
+			^ \. \s*
+				(?{local (@L,@R,@C,@Z)}) ($expr)
+			$
+
+			(?{
+				print "[2B\r", " " x $WIDTH, "\r[1;33m\$[00m ", val expr ($1, pos);
+				<STDIN> and print "[3A"
+			})
+
+		}x or m{
+			^ ([\<\>])((??{$1})?) (?: \s* (?{local (@L,@R,@C,@Z)}) ($expr) )?
+			$
+			(?{
+				my $sh;
+				unless ($3) {
+					$sh = $2 ? $lview : 5;
+				} else {
+					$sh = val expr $3, pos
+				}
+
+				$sh = -$sh if $1 eq '<';
+
+				if ($lview + $sh >= 0) {
+					$lview += $sh;
+					$rview += $sh;
+				}
+			})
+		}x;
+		
+		do {
+			unless ($WARN) {
+				redo SYMBOL if $dir != $olddir;
+				last DEBUG;
+			}
+		} if m{
+			^ \^ \s*
+				(?{local $n = $number + 1})
+				(?: (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $n = $idx [val expr $1, pos]}) )?
+			$
+
+			(?{push @brk, ['line', $n]})
+
+		}x or m{
+			^ \{\{ $
+			(?{$dir = -1 ; $offset -= 1})
+
+		}x or m{
+			^ \}\} $
+			(?{$dir = +1})
+		
+		}x or m{
+			^ ([\@\{\}]) (\!)? (\*|$cmnd)? \s*	(?{local ($s, $e, $l, $r)})
+			(?:
+				\[
+					\s* (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $l = expr $4, pos})
+					\s* \;
+					\s* (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $r = expr $5, pos}) \s*
+				\]
+				(?{
+					# for closures in (?{})
+					#
+					local $s = ( sub {
+						my ($l, $r) = @_;
+						return sub {
+							my $e = shift;
+							$e >= val $l && $e <= val $r
+						}
+					} ) -> ($l, $r);
+				})
+
+				|
+
+				\? \s* (?: (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $e = expr $6, pos}) )?
+				(?{
+					local $s;
+					unless ($e) {
+						$s = sub {
+							$mem[shift] != 0
+						}
+					} else {
+						$s = ( sub {
+							my $e = shift;
+							return sub {
+								return not not val $e;
+							}
+						} ) -> ($e)
+					}
+				})
+
+				|
+
+				(\<\=|\>\=|[\=\>\<])? \s*
+				(?{local (@L,@R,@C,@Z)}) ($expr) (?{local $c = expr $8, pos})
+				(?{
+					my $o = $7 || '=';
+					$o = '==' if $o eq '=';
+
+					local $s = $1 eq '@' ? ( sub { 
+						my ($o, $c) = @_;
+						return sub {
+							my ($e, $cc) = ($mem[shift], val $c);
+							return eval "($e) $o ($cc)"
+						}
+					} ) -> ($o, $c) : ( sub {
+						my ($o, $c) = @_;
+						return sub {
+							my ($e, $cc) = (shift, val $c);
+							return eval "($e) $o ($cc)"
+						}
+					} ) -> ($o, $c)
+				})
+			)?
+			$
+
+			(?{
+				unless ($2 || $3 || $s) {
+					if ($1 eq '@') {
+						$WARN = 'true'
+					} elsif ($1 eq '}') {
+						$s = sub { 1 }
+					} elsif ($1 eq '{') {
+						$s = ( sub {
+							my $i = 0;
+							return sub {
+								return $i ++
+							}
+						} ) -> ();
+					}
+				}
+
+				if ($2 || $4 || $s) {
+
+					my ($t, $r) = ($1 eq '@' ? 'cell' : 'cmnd');
+					if ($3 ne '*') {
+						if ($3) {
+							$r = $2 eq '!' ? "(?=[^$3])$cmnd" : "[\\$3]"
+						} else {
+							$r = '.'
+						}
+					} else {
+						$r = $2 eq '!' ? '[\<\>\.\[\]]' : '[\+\-\,]'
+					}
+
+					push @brk, [ $t, qr/$r/, $s || sub { 1 } ];
+
+					$dir = +1 if $1 eq $RBC;
+					$dir = -1 if $1 eq $LBC;
+				}
+			})
+		}x or m{
+			^ \] \s*
+				(?: (?{local (@L,@R,@C,@Z)}) ($expr) (?{local $e = expr $1, pos}) )?
+			$
+
+			(?{
+				push @brk, [ 'for', $#stk, $e || 0 ]
+			})
+		}x;
+
+		$WARN = 'true' unless /^\s*$/;
+		redo DEBUG if $WARN;
+	
+
+	} elsif (! @brk and ! $run) {
+		sleep $slp;
+		print "[1B"
+	}
+
+	}	# END DEBUG
+
+
+=for man
+
+=head1 EXAMPLES
+
+=head3 From debugger
+
+=over 1
+
+=over 4
+
+=item $ B<,3>
+
+$mem [$cur] = 3
+
+=item $ B<,(#+8)@>
+
+$mem [$cur + 8] = $mem [$cur]
+
+=item $ B<@ [#+1;#+5]>
+
+continue until data pointer will between ($cur + 1) and ($cur + 5)
+
+=item $ B<< @!*? $@ > 3 >>
+
+continue until current command will not modify memory and '$mem [$cur] > 3' will be true
+
+=item $ B<< {< <10 >>
+
+change direction to reversed and continue undoing commands until current command will be `<' and its number in the line will be lesser then 10
+
+=back
+
+=back
+
+=head3 From shell
+
+ % echo ',++.' > example.b
+ % bfu -n -i example.b
+ 123
+ 125
+
+ % bfu
+ + bfu 0.2
+ + brainfuck debugger
+ +++++[->+++++[->+++++<]<]>>----[->+>+<<]>-----------------.---.>.
+ !
+ [0] 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0 0
+ {1:0} +++++[->+++++[->+++++<]<]>>----[->+>+<<]>-----------------.---.>.
+ > hey
+ $ }65
+
+=cut
+
+
+	if ($_ eq '!') {
+		<STDIN> if $slp;
+		last SYMBOL
+	}
+
+
+	# run command
+	#
+	elsif ($_ eq '>') {
+		$dir == 1 ? $pos ++ : $pos --
+
+	} elsif ($_ eq '<') {
+		$dir == 1 ? $pos -- : $pos ++
+
+	} elsif ($_ eq '+') {
+		$dir == 1 ? $mem[$pos] ++ : $mem[$pos] --
+
+	} elsif ($_ eq '-') {
+		$dir == 1 ? $mem[$pos] -- : $mem[$pos] ++
+
+	} elsif ($_ eq ',') {
+
+		if ($dir == 1) {
+			unless (@dat) {
+				unless ($run) {
+					print "[2B\r" . (' ' x 50) . "\r[1;31m#[00m ";
+					my $s = substr scalar <STDIN>, 0, -1;
+					push @dat, $int ? 0 + $s : ord $s;
+					print "[3A";
+				} else {
+					if ($int) {
+						push @dat, map { $_ == 0 && !/0+.?0*/ ? ord : $_ }
+							split /\s+/, scalar <STDIN>;
+					} else {
+						push @dat, map { ord } split //, scalar <STDIN>
+					}
+				}
+			}
+
+			push @{$back{$pos}}, $mem[$pos];
+			$mem[$pos] = shift @dat;
+
+		} else {
+			$mem[$pos] = pop @{$back{$pos}};
+		}
+
+	} elsif ($_ eq '.') {
+		if ($dir == 1) {
+			if ($run) {
+				print 0 + $mem[$pos], " " if $int;
+				syswrite STDOUT, pack "c", $mem[$pos] unless $int;
+			} else {
+				$show .= $int ? 0 + $mem[$pos] : pack "c", $mem[$pos];
+				$show = substr $show, -20;
+				print "[1B\r" . (' ' x 50);
+				print "\r> " . $show . "[1A";
+			}
+		}
+	} elsif ($_ eq '[') {
+		if ($dir == 1) {
+			unshift @{$ncache{$n}} unless $run;
+			if (! $mem[$pos]) {
+				if (exists $rcache{$n}) {
+					($n, $number, $offset, $noff) = @{$rcache{$n}};
+				} else {
+					push @target, $n;
+					$deep ++
+				}
+			} else {
+				push @stk, [ $n, $number, $offset, $noff ];
+			}
+		} else {
+			if ($ncache{$n}->[0] --) {
+				($n, $number, $offset, $noff) = @{$dark_stk[$#dark_stk]};
+			} else {
+				pop @dark_stk;
+				pop @stk;
+				shift @{$ncache{$n}};
+			}
+		}
+	} elsif ($_ eq ']') {
+		if ($dir == 1) {
+			$lcache{$n} = $stk[$#stk] unless $run or exists $lcache{$n};
+
+			if ($mem[$pos]) {
+				($n, $number, $offset, $noff) = @{$stk[$#stk]};
+				$ncache{$n}->[0] ++ unless $run;
+
+			} else {
+				pop @stk;
+			}
+		} elsif ($dir == -1) {
+			my $nn = $lcache{$n}->[0];
+			if ($ncache{$nn}->[0]) {
+				push @stk, $lcache{$n};
+				push @dark_stk, [ $n, $number, $offset, $noff ];
+			} else {
+				shift @{$ncache{$n}};
+				($n, $number, $offset, $noff) = @{$lcache{$n}};
+			}
+		}
+	}
+}
+
+# finish debugging
+#
+print "[3B" unless $run;
+
+
+=for man
+
+=head1 PREPROCESSING
+
+With B<-p> option, program will be preprocessed like bfpp from awib project does it. It is useful for big programs and also it is necessary for correct line numbers while debugging.
+
+With B<-d> option, bfu will format program for dbfi. It is useful if you want to use dbfi in pipes, like this:
+
+	echo 'my data' | bfu -d program.b | dbfi
+
+It is equal to
+
+	echo "`cat program.b`\!my data" | dbfi
+
+except `bfu -d` will also preprocess program and concatenate data after `!' in program.b with STDIN (if any).
+
+=cut
+
+
+
+=for man
+
+=head1 AUTHOR
+
+Victor Gaydov <victor@enise.org>, 2009.
+
+=cut
+
+
